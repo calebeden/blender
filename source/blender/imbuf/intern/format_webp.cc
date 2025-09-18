@@ -32,14 +32,58 @@
 
 #include "CLG_log.h"
 
+// We're going to use RLBox in a single-threaded environment.
+// #define RLBOX_SINGLE_THREADED_INVOCATIONS
+// The fixed configuration line we need to use for the noop sandbox.
+// It specifies that all calls into the sandbox are resolved statically.
+#define RLBOX_USE_STATIC_CALLS() rlbox_noop_sandbox_lookup_symbol
+
+#include "rlbox.hpp"
+#include "rlbox_noop_sandbox.hpp"
+
+using namespace rlbox;
+
+// Define base type for mylib using the noop sandbox
+RLBOX_DEFINE_BASE_TYPES_FOR(libwebp, noop);
+
+#include "libwebp_struct_file.h"
+rlbox_load_structs_from_library(libwebp);
+
+static rlbox_sandbox_libwebp sandbox;
+static bool sandbox_initialized = false;
+
+static inline void init_sandbox()
+{
+  if (!sandbox_initialized) {
+    sandbox.create_sandbox();
+    sandbox_initialized = true;
+  }
+}
+
+static inline void destroy_sandbox()
+{
+  if (sandbox_initialized) {
+    sandbox.destroy_sandbox();
+    sandbox_initialized = false;
+  }
+}
+
 static CLG_LogRef LOG = {"image.webp"};
 
 bool imb_is_a_webp(const uchar *mem, size_t size)
 {
-  if (WebPGetInfo(mem, size, nullptr, nullptr)) {
-    return true;
-  }
-  return false;
+  init_sandbox();
+
+  auto tainted_mem = sandbox.malloc_in_sandbox<uchar>(size);
+  memcpy(sandbox, tainted_mem, mem, size);
+
+  bool ret = sandbox.invoke_sandbox_function(WebPGetInfo, tainted_mem, size, nullptr, nullptr)
+                 .copy_and_verify([](int result) { return result != 0; });
+
+  sandbox.free_in_sandbox(tainted_mem);
+
+  destroy_sandbox();
+  return ret;
 }
 
 ImBuf *imb_loadwebp(const uchar *mem, size_t size, int flags, ImFileColorSpace & /*r_colorspace*/)
@@ -48,14 +92,31 @@ ImBuf *imb_loadwebp(const uchar *mem, size_t size, int flags, ImFileColorSpace &
     return nullptr;
   }
 
-  WebPBitstreamFeatures features;
-  if (WebPGetFeatures(mem, size, &features) != VP8_STATUS_OK) {
+  init_sandbox();
+
+  auto tainted_mem = sandbox.malloc_in_sandbox<uchar>(size);
+  memcpy(sandbox, tainted_mem, mem, size);
+
+  auto tainted_features = sandbox.malloc_in_sandbox<WebPBitstreamFeatures>();
+  auto raw_features = tainted_features.unverified_safe_pointer_because(
+      sizeof(WebPBitstreamFeatures), "just allocated");
+  new (raw_features) WebPBitstreamFeatures();
+  auto features_status = sandbox.invoke_sandbox_function(
+      WebPGetFeatures, tainted_mem, size, tainted_features);
+  if (features_status.copy_and_verify(
+          [](VP8StatusCode result) { return result != VP8_STATUS_OK; }))
+  {
     CLOG_ERROR(&LOG, "Failed to parse features");
+    destroy_sandbox();
     return nullptr;
   }
 
-  const int planes = features.has_alpha ? 32 : 24;
-  ImBuf *ibuf = IMB_allocImBuf(features.width, features.height, planes, 0);
+  int width = tainted_features->width.copy_and_verify([](int w) { return w; });
+  int height = tainted_features->height.copy_and_verify([](int h) { return h; });
+  bool has_alpha = tainted_features->has_alpha.copy_and_verify([](int a) { return a != 0; });
+
+  const int planes = has_alpha ? 32 : 24;
+  ImBuf *ibuf = IMB_allocImBuf(width, height, planes, 0);
 
   if (ibuf == nullptr) {
     CLOG_ERROR(&LOG, "Failed to allocate image memory");
@@ -67,12 +128,30 @@ ImBuf *imb_loadwebp(const uchar *mem, size_t size, int flags, ImFileColorSpace &
     IMB_alloc_byte_pixels(ibuf);
     /* Flip the image during decoding to match Blender. */
     uchar *last_row = ibuf->byte_buffer.data + (4 * size_t(ibuf->y - 1) * size_t(ibuf->x));
-    if (WebPDecodeRGBAInto(mem, size, last_row, size_t(ibuf->x) * ibuf->y * 4, -4 * ibuf->x) ==
-        nullptr)
-    {
+
+    auto tainted_last_row = sandbox.malloc_in_sandbox<uchar>(4 * size_t(ibuf->x) *
+                                                             size_t(ibuf->y));
+
+    auto decode_status = sandbox.invoke_sandbox_function(WebPDecodeRGBAInto,
+                                                         tainted_mem,
+                                                         size,
+                                                         tainted_last_row,
+                                                         size_t(ibuf->x) * ibuf->y * 4,
+                                                         -4 * ibuf->x);
+
+    if (decode_status == nullptr) {
       CLOG_ERROR(&LOG, "Failed to decode image");
     }
+
+    std::unique_ptr<uchar[]> copied_last_row = tainted_last_row.copy_and_verify_range(
+        [&](std::unique_ptr<uchar[]> val) { return val; }, size);
+    memcpy(last_row, copied_last_row.get(), 4 * size_t(ibuf->x) * size_t(ibuf->y));
   }
+
+  sandbox.free_in_sandbox(tainted_features);
+  sandbox.free_in_sandbox(tainted_mem);
+
+  destroy_sandbox();
 
   return ibuf;
 }
@@ -90,44 +169,56 @@ ImBuf *imb_load_filepath_thumbnail_webp(const char *filepath,
   }
 
   imb_mmap_lock();
-  BLI_mmap_file *mmap_file = BLI_mmap_open(file);
+  auto tainted_mmap_file = sandbox.invoke_sandbox_function(BLI_mmap_open, file);
   imb_mmap_unlock();
   close(file);
-  if (mmap_file == nullptr) {
+  if (tainted_mmap_file == nullptr) {
     return nullptr;
   }
 
-  const uchar *data = static_cast<const uchar *>(BLI_mmap_get_pointer(mmap_file));
-  const size_t data_size = BLI_mmap_get_length(mmap_file);
+  auto tainted_data = sandbox_reinterpret_cast<const char *>(
+      sandbox.invoke_sandbox_function(BLI_mmap_get_pointer, tainted_mmap_file));
+  // auto data_size = sandbox.invoke_sandbox_function(BLI_mmap_get_length, tainted_mmap_file)
+  //                      .copy_and_verify([](size_t size) { return size; });
 
-  WebPDecoderConfig config;
-  if (!data || !WebPInitDecoderConfig(&config) ||
-      WebPGetFeatures(data, data_size, &config.input) != VP8_STATUS_OK)
+  auto tainted_config = sandbox.malloc_in_sandbox<WebPDecoderConfig>();
+  auto raw_config = tainted_config.unverified_safe_pointer_because(sizeof(WebPDecoderConfig),
+                                                                   "just allocated");
+  if (tainted_data == nullptr ||
+      !sandbox.invoke_sandbox_function(WebPInitDecoderConfig, tainted_config)
+           .copy_and_verify([](int s) { return s; }) /* ||
+           TODO: put back, remove temp
+       sandbox.invoke_sandbox_function(WebPGetFeatures, tainted_data, data_size, tainted_config->input)
+          .copy_and_verify([](int s) { return s != VP8_STATUS_OK; }) */ )
   {
     CLOG_ERROR(&LOG, "Invalid file");
     imb_mmap_lock();
-    BLI_mmap_free(mmap_file);
+    sandbox.invoke_sandbox_function(BLI_mmap_free, tainted_mmap_file);
     imb_mmap_unlock();
     return nullptr;
   }
 
-  /* Return full size of the image. */
-  *r_width = size_t(config.input.width);
-  *r_height = size_t(config.input.height);
+  auto width = tainted_config->input.width.copy_and_verify([](int w) { return w; });
+  auto height = tainted_config->input.height.copy_and_verify([](int h) { return h; });
 
-  const float scale = float(max_thumb_size) / std::max(config.input.width, config.input.height);
-  const int dest_w = std::max(int(config.input.width * scale), 1);
-  const int dest_h = std::max(int(config.input.height * scale), 1);
+  /* Return full size of the image. */
+  *r_width = size_t(width);
+  *r_height = size_t(height);
+
+  const float scale = float(max_thumb_size) / std::max(width, height);
+  const int dest_w = std::max(int(width * scale), 1);
+  const int dest_h = std::max(int(height * scale), 1);
 
   ImBuf *ibuf = IMB_allocImBuf(dest_w, dest_h, 32, IB_byte_data);
   if (ibuf == nullptr) {
     CLOG_ERROR(&LOG, "Failed to allocate image memory");
     imb_mmap_lock();
-    BLI_mmap_free(mmap_file);
+    sandbox.invoke_sandbox_function(BLI_mmap_free, tainted_mmap_file);
     imb_mmap_unlock();
     return nullptr;
   }
 
+  auto &config = *raw_config;
   config.options.no_fancy_upsampling = 1;
   config.options.use_scaling = 1;
   config.options.scaled_width = dest_w;
@@ -141,21 +232,25 @@ ImBuf *imb_load_filepath_thumbnail_webp(const char *filepath,
   config.output.u.RGBA.stride = 4 * ibuf->x;
   config.output.u.RGBA.size = size_t(config.output.u.RGBA.stride) * size_t(ibuf->y);
 
-  if (WebPDecode(data, data_size, &config) != VP8_STATUS_OK) {
+  // TODO
+  if (true /* sandbox.invoke_sandbox_function(WebPDecode, tainted_data, data_size, tainted_config)
+          .copy_and_verify([](int s) { return s != VP8_STATUS_OK; }) */)
+  {
     CLOG_ERROR(&LOG, "Failed to decode image");
     IMB_freeImBuf(ibuf);
 
     imb_mmap_lock();
-    BLI_mmap_free(mmap_file);
+    sandbox.invoke_sandbox_function(BLI_mmap_free, tainted_mmap_file);
     imb_mmap_unlock();
     return nullptr;
   }
 
   /* Free the output buffer. */
-  WebPFreeDecBuffer(&config.output);
+  // TODO
+  // sandbox.invoke_sandbox_function(WebPFreeDecBuffer, tainted_config->output);
 
   imb_mmap_lock();
-  BLI_mmap_free(mmap_file);
+  sandbox.invoke_sandbox_function(BLI_mmap_free, tainted_mmap_file);
   imb_mmap_unlock();
 
   return ibuf;
@@ -170,9 +265,10 @@ bool imb_savewebp(ImBuf *ibuf, const char *filepath, int /*flags*/)
   }
 
   const int bytesperpixel = (ibuf->planes + 7) >> 3;
-  uchar *encoded_data, *last_row;
+  uchar *last_row;
   size_t encoded_data_size;
 
+  auto tainted_encoded_data = sandbox.malloc_in_sandbox<uchar *>();
   if (bytesperpixel == 3) {
     /* We must convert the ImBuf RGBA buffer to RGB as WebP expects a RGB buffer. */
     const size_t num_pixels = IMB_get_pixel_count(ibuf);
@@ -186,58 +282,103 @@ bool imb_savewebp(ImBuf *ibuf, const char *filepath, int /*flags*/)
 
     last_row = (uchar *)(rgb_rect + (size_t(ibuf->y - 1) * size_t(ibuf->x) * 3));
 
+    auto row = sandbox.malloc_in_sandbox<uint8_t>(num_pixels * 3);
+    memcpy(sandbox, row, last_row, num_pixels * 3);
+
     if (ibuf->foptions.quality == 100.0f) {
-      encoded_data_size = WebPEncodeLosslessRGB(
-          last_row, ibuf->x, ibuf->y, -3 * ibuf->x, &encoded_data);
+      encoded_data_size =
+          sandbox
+              .invoke_sandbox_function(
+                  WebPEncodeLosslessRGB, row, ibuf->x, ibuf->y, -3 * ibuf->x, tainted_encoded_data)
+              .copy_and_verify([](size_t size) { return size; });
     }
     else {
-      encoded_data_size = WebPEncodeRGB(
-          last_row, ibuf->x, ibuf->y, -3 * ibuf->x, ibuf->foptions.quality, &encoded_data);
+      encoded_data_size = sandbox
+                              .invoke_sandbox_function(WebPEncodeRGB,
+                                                       row,
+                                                       ibuf->x,
+                                                       ibuf->y,
+                                                       -3 * ibuf->x,
+                                                       ibuf->foptions.quality,
+                                                       tainted_encoded_data)
+                              .copy_and_verify([](size_t size) { return size; });
     }
     MEM_freeN(rgb_rect);
   }
   else if (bytesperpixel == 4) {
+    const size_t num_pixels = IMB_get_pixel_count(ibuf);
     last_row = ibuf->byte_buffer.data + 4 * size_t(ibuf->y - 1) * size_t(ibuf->x);
+    auto row = sandbox.malloc_in_sandbox<uint8_t>(num_pixels * 4);
+    memcpy(sandbox, row, last_row, num_pixels * 4);
 
     if (ibuf->foptions.quality == 100.0f) {
-      encoded_data_size = WebPEncodeLosslessRGBA(
-          last_row, ibuf->x, ibuf->y, -4 * ibuf->x, &encoded_data);
+      encoded_data_size = sandbox
+                              .invoke_sandbox_function(WebPEncodeLosslessRGBA,
+                                                       row,
+                                                       ibuf->x,
+                                                       ibuf->y,
+                                                       -4 * ibuf->x,
+                                                       tainted_encoded_data)
+                              .copy_and_verify([](size_t size) { return size; });
     }
     else {
-      encoded_data_size = WebPEncodeRGBA(
-          last_row, ibuf->x, ibuf->y, -4 * ibuf->x, ibuf->foptions.quality, &encoded_data);
+      encoded_data_size = sandbox
+                              .invoke_sandbox_function(WebPEncodeRGBA,
+                                                       row,
+                                                       ibuf->x,
+                                                       ibuf->y,
+                                                       -4 * ibuf->x,
+                                                       ibuf->foptions.quality,
+                                                       tainted_encoded_data)
+                              .copy_and_verify([](size_t size) { return size; });
     }
   }
   else {
     CLOG_ERROR(&LOG, "Unsupported bytes per pixel: %d for file: '%s'", bytesperpixel, filepath);
+    sandbox.free_in_sandbox(tainted_encoded_data);
     return false;
   }
 
-  if (encoded_data == nullptr) {
-    return false;
-  }
+  // TODO
+  // if (*tainted_encoded_data == nullptr) {
+  //   sandbox.free_in_sandbox(tainted_encoded_data);
+  //   return false;
+  // }
 
-  WebPMux *mux = WebPMuxNew();
-  WebPData image_data = {encoded_data, encoded_data_size};
-  WebPMuxSetImage(mux, &image_data, false /* Don't copy data */);
+  auto tainted_mux = sandbox.invoke_sandbox_function(WebPMuxNew);
+  auto image_data = sandbox.malloc_in_sandbox<WebPData>();
+  // TODO
+  // image_data->bytes = tainted_encoded_data;
+  image_data->size = encoded_data_size;
+  sandbox.invoke_sandbox_function(
+      WebPMuxSetImage, tainted_mux, image_data, false /* Don't copy data */);
 
   /* Write ICC profile if there is one associated with the colorspace. */
   const ColorSpace *colorspace = ibuf->byte_buffer.colorspace;
   if (colorspace) {
     blender::Vector<char> icc_profile = IMB_colormanagement_space_icc_profile(colorspace);
     if (!icc_profile.is_empty()) {
-      WebPData icc_chunk = {reinterpret_cast<const uint8_t *>(icc_profile.data()),
-                            size_t(icc_profile.size())};
-      WebPMuxSetChunk(mux, "ICCP", &icc_chunk, true /* copy data */);
+      // TODO
+      // WebPData icc_chunk = {reinterpret_cast<const uint8_t *>(icc_profile.data()),
+      //                       size_t(icc_profile.size())};
+      auto icc_chunk = sandbox.malloc_in_sandbox<WebPData>();
+      auto iccp_string = sandbox.malloc_in_sandbox<char>(5);
+      strncpy(sandbox, iccp_string, "ICCP", 5);
+      sandbox.invoke_sandbox_function(
+          WebPMuxSetChunk, tainted_mux, iccp_string, icc_chunk, true /* copy data */);
     }
   }
 
   /* Assemble image and metadata. */
-  WebPData output_data;
-  if (WebPMuxAssemble(mux, &output_data) != WEBP_MUX_OK) {
+  auto tainted_output_data = sandbox.malloc_in_sandbox<WebPData>();
+  if (sandbox.invoke_sandbox_function(WebPMuxAssemble, tainted_mux, tainted_output_data)
+          .copy_and_verify([](WebPMuxError result) { return result != WEBP_MUX_OK; }))
+  {
     CLOG_ERROR(&LOG, "Error in mux assemble writing file: '%s'", filepath);
-    WebPMuxDelete(mux);
-    WebPFree(encoded_data);
+    sandbox.invoke_sandbox_function(WebPMuxDelete, tainted_mux);
+    sandbox.invoke_sandbox_function(WebPFree, tainted_encoded_data);
+    sandbox.free_in_sandbox(tainted_encoded_data);
+    sandbox.free_in_sandbox(tainted_output_data);
     return false;
   }
 
@@ -245,10 +386,11 @@ bool imb_savewebp(ImBuf *ibuf, const char *filepath, int /*flags*/)
   bool ok = true;
   FILE *fp = BLI_fopen(filepath, "wb");
   if (fp) {
-    if (fwrite(output_data.bytes, output_data.size, 1, fp) != 1) {
-      CLOG_ERROR(&LOG, "Unknown error writing file: '%s'", filepath);
-      ok = false;
-    }
+    // TODO
+    // if (fwrite(tainted_output_data->bytes, tainted_output_data->size, 1, fp) != 1) {
+    //   CLOG_ERROR(&LOG, "Unknown error writing file: '%s'", filepath);
+    //   ok = false;
+    // }
 
     fclose(fp);
   }
@@ -257,9 +399,11 @@ bool imb_savewebp(ImBuf *ibuf, const char *filepath, int /*flags*/)
     CLOG_ERROR(&LOG, "Cannot open file for writing: '%s'", filepath);
   }
 
-  WebPMuxDelete(mux);
-  WebPFree(encoded_data);
-  WebPDataClear(&output_data);
+  sandbox.invoke_sandbox_function(WebPMuxDelete, tainted_mux);
+  sandbox.invoke_sandbox_function(WebPFree, *tainted_encoded_data);
+  sandbox.invoke_sandbox_function(WebPDataClear, tainted_output_data);
+  sandbox.free_in_sandbox(tainted_encoded_data);
+  sandbox.free_in_sandbox(tainted_output_data);
 
   return ok;
 }
